@@ -16,6 +16,7 @@ env:
   FRB_VERSION: "1.80.1"
   CARGO_EXPAND_VERSION: "1.0.95"
   LLVM_VERSION: "15.0.6"
+  VCPKG_COMMIT: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 concurrency:
@@ -86,6 +87,33 @@ jobs:
           echo "flutter/assets entries: $assets"
           test "$assets" -ge 60
 
+      # magnum-opus 是非可选依赖，它的 build.rs 在 Windows 上只走 vcpkg，缺 VCPKG_ROOT 会直接 panic。
+      # 这里按上游 baseline 装 vcpkg，但只装 opus 静态库；vcpkg.json 里的 ffmpeg/libvpx 等留给 --hwcodec/--vram。
+      - name: Install vcpkg + opus
+        run: |
+          root="$(pwd)"
+          vcpkg_dir="$root/../vcpkg"
+          run_dir="$root/../vcpkg-run"
+          git init -q "$vcpkg_dir"
+          cd "$vcpkg_dir"
+          git remote add origin https://github.com/microsoft/vcpkg
+          git fetch -q --depth 1 origin "$VCPKG_COMMIT" || {
+            echo "::warning::cannot fetch pinned vcpkg commit $VCPKG_COMMIT, falling back to master"
+            git fetch -q --depth 1 origin master
+          }
+          git checkout -q FETCH_HEAD
+          cmd //c bootstrap-vcpkg.bat -disableMetrics
+          # 在空目录里跑，避免被 vcpkg 仓库自带的清单模式接管
+          mkdir -p "$run_dir"
+          cd "$run_dir"
+          "$vcpkg_dir/vcpkg.exe" install opus:x64-windows-static --clean-after-build
+          ls "$vcpkg_dir/installed/x64-windows-static/lib" | grep -i opus
+          {
+            echo "VCPKG_ROOT=$(cygpath -w "$vcpkg_dir")"
+            echo "VCPKG_INSTALLED_ROOT=$(cygpath -w "$vcpkg_dir/installed")"
+            echo "VCPKG_DEFAULT_TRIPLET=x64-windows-static"
+          } >> "$GITHUB_ENV"
+
       # 仓库里不含生成的 FFI 桥接文件（gitignore），必须先跑一次 codegen。
       - name: Install FFI codegen
         run: |
@@ -108,7 +136,8 @@ jobs:
 
       # build.py 会依次执行 cargo build --lib、flutter build windows --release，
       # 并把虚拟屏 dylib 拷进产物目录。--skip-portable-pack 只跳过单文件打包。
-      # 需要硬件编码时改成 --hwcodec --vram，并额外准备 vcpkg（见 README / 上游 workflow）。
+      # 需要硬件编码时改成 --hwcodec --vram，并在根目录额外装 vcpkg.json 里的清单
+      # （vcpkg install --x-manifest-root=. --triplet x64-windows-static），否则链接会缺 ffmpeg/libvpx。
       - name: Build RustDesk
         run: |
           rustc -vV
