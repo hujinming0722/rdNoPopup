@@ -87,9 +87,16 @@ jobs:
           echo "flutter/assets entries: $assets"
           test "$assets" -ge 60
 
-      # magnum-opus 是非可选依赖，它的 build.rs 在 Windows 上只走 vcpkg，缺 VCPKG_ROOT 会直接 panic。
-      # 这里按上游 baseline 装 vcpkg，但只装 opus 静态库；vcpkg.json 里的 ffmpeg/libvpx 等留给 --hwcodec/--vram。
-      - name: Install vcpkg + opus
+      # magnum-opus 和 scrap 都通过 vcpkg 找原生库：opus 来自 magnum-opus，
+      # libyuv/libvpx/aom 是 scrap build.rs 无条件链接 + bindgen 的（与 --hwcodec 无关）。
+      # 依然不装 vcpkg.json 里的 ffmpeg/mfx-dispatch，那些只有 --hwcodec/--vram 才需要。
+      - name: Restore vcpkg cache
+        uses: actions/cache@v4
+        with:
+          path: ../vcpkg/installed
+          key: vcpkg-${{ env.VCPKG_COMMIT }}-x64-windows-static-opus-libyuv-libvpx-aom
+
+      - name: Install vcpkg + native deps
         run: |
           root="$(pwd)"
           vcpkg_dir="$root/../vcpkg"
@@ -106,8 +113,9 @@ jobs:
           # 在空目录里跑，避免被 vcpkg 仓库自带的清单模式接管
           mkdir -p "$run_dir"
           cd "$run_dir"
-          "$vcpkg_dir/vcpkg.exe" install opus:x64-windows-static --clean-after-build
-          ls "$vcpkg_dir/installed/x64-windows-static/lib" | grep -i opus
+          "$vcpkg_dir/vcpkg.exe" install opus libyuv libvpx aom \
+            --triplet x64-windows-static --clean-after-build
+          ls "$vcpkg_dir/installed/x64-windows-static/lib" | grep -Ei "opus|vpx|yuv|aom"
           {
             echo "VCPKG_ROOT=$(cygpath -w "$vcpkg_dir")"
             echo "VCPKG_INSTALLED_ROOT=$(cygpath -w "$vcpkg_dir/installed")"
