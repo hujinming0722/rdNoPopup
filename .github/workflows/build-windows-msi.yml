@@ -51,6 +51,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           targets: x86_64-pc-windows-msvc
+          # flutter_rust_bridge_codegen 生成 Rust 代码后要调 rustfmt
+          components: rustfmt
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
