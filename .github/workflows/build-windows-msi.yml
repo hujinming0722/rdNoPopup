@@ -1,0 +1,135 @@
+name: Build Windows MSI
+
+# 手动触发，或推送 v* tag 时触发。
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: "3.24.5"
+  RUST_VERSION: "1.75"
+  FRB_VERSION: "1.80.1"
+  CARGO_EXPAND_VERSION: "1.0.95"
+  LLVM_VERSION: "15.0.6"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+concurrency:
+  group: windows-msi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-msi:
+    name: Windows x64 MSI
+    runs-on: windows-2022
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install LLVM (libclang for bindgen)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: ${{ env.LLVM_VERSION }}
+          directory: ${{ runner.temp }}/llvm
+
+      - name: Export LIBCLANG_PATH
+        run: echo "LIBCLANG_PATH=${{ runner.temp }}/llvm/bin" >> "$GITHUB_ENV"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rustdesk-windows-msi
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # 仓库里不含生成的 FFI 桥接文件（gitignore），必须先跑一次 codegen。
+      - name: Install FFI codegen
+        run: |
+          cargo install cargo-expand --version "$CARGO_EXPAND_VERSION" --locked
+          cargo install flutter_rust_bridge_codegen --version "$FRB_VERSION" --features uuid --locked
+
+      - name: Generate FFI bridge
+        run: |
+          flutter config --enable-windows-desktop
+          (cd flutter && flutter pub get)
+          flutter_rust_bridge_codegen \
+            --rust-input ./src/flutter_ffi.rs \
+            --dart-output ./flutter/lib/generated_bridge.dart
+          test -f src/bridge_generated.rs
+          test -f flutter/lib/generated_bridge.dart
+          # frb 1.x 只有在生成结果里带 part 时才需要 freezed 代码生成。
+          if grep -q "part 'generated_bridge.freezed.dart'" flutter/lib/generated_bridge.dart; then
+            (cd flutter && dart run build_runner build --delete-conflicting-outputs)
+          fi
+
+      # build.py 会依次执行 cargo build --lib、flutter build windows --release，
+      # 并把虚拟屏 dylib 拷进产物目录。--skip-portable-pack 只跳过单文件打包。
+      # 需要硬件编码时改成 --hwcodec --vram，并额外准备 vcpkg（见 README / 上游 workflow）。
+      - name: Build RustDesk
+        run: python build.py --flutter --skip-portable-pack
+
+      - name: Stage distribution
+        run: |
+          rm -rf rustdesk
+          cp -r "flutter/build/windows/x64/runner/Release" rustdesk
+          ls -la rustdesk
+
+      # WiX 4 + 原生 CustomActions，需要用 VS2022 的 MSBuild。
+      - name: Build MSI
+        run: |
+          cd res/msi
+          python preprocess.py --arp -d ../../rustdesk
+          curl -fsSL -o nuget.exe https://dist.nuget.org/win-x86-commandline/latest/nuget.exe
+          # WiX SDK 是 MSBuild SDK 形式，nuget 失败时回退到 msbuild -t:restore
+          ./nuget.exe restore msi.sln || msbuild msi.sln -t:restore -p:RestorePackagesConfig=true
+          msbuild msi.sln -p:Configuration=Release -p:Platform=x64 -p:TargetVersion=Windows10
+
+      - name: Collect MSI
+        run: |
+          msi="$(find res/msi/Package/bin -name Package.msi -path '*Release*' | head -n 1)"
+          test -n "$msi"
+          echo "found: $msi"
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          mkdir -p out
+          cp "$msi" "out/rustdesk-${version}-x64.msi"
+          sha256sum out/*.msi
+          ls -l out
+
+      - name: Upload MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-windows-x64-msi
+          path: out/*.msi
+          if-no-files-found: error
+          retention-days: 14
