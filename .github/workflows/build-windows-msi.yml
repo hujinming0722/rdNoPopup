@@ -75,6 +75,17 @@ jobs:
       - name: Set up MSBuild
         uses: microsoft/setup-msbuild@v2
 
+      # 快速失败检查：这些缺一个后面都会以很难懂的方式报错。
+      - name: Preflight checks
+        run: |
+          rustfmt --version
+          python --version
+          test -f res/icon.ico
+          test -f res/manifest.xml
+          assets="$(ls flutter/assets | wc -l)"
+          echo "flutter/assets entries: $assets"
+          test "$assets" -ge 60
+
       # 仓库里不含生成的 FFI 桥接文件（gitignore），必须先跑一次 codegen。
       - name: Install FFI codegen
         run: |
@@ -99,7 +110,9 @@ jobs:
       # 并把虚拟屏 dylib 拷进产物目录。--skip-portable-pack 只跳过单文件打包。
       # 需要硬件编码时改成 --hwcodec --vram，并额外准备 vcpkg（见 README / 上游 workflow）。
       - name: Build RustDesk
-        run: python build.py --flutter --skip-portable-pack
+        run: |
+          rustc -vV
+          python build.py --flutter --skip-portable-pack
 
       - name: Stage distribution
         run: |
@@ -115,18 +128,35 @@ jobs:
           curl -fsSL -o nuget.exe https://dist.nuget.org/win-x86-commandline/latest/nuget.exe
           # WiX SDK 是 MSBuild SDK 形式，nuget 失败时回退到 msbuild -t:restore
           ./nuget.exe restore msi.sln || msbuild msi.sln -t:restore -p:RestorePackagesConfig=true
-          msbuild msi.sln -p:Configuration=Release -p:Platform=x64 -p:TargetVersion=Windows10
+          msbuild msi.sln -p:Configuration=Release -p:Platform=x64 -p:TargetVersion=Windows10 \
+            -fl -flp:logfile=msbuild.log
 
       - name: Collect MSI
         run: |
           msi="$(find res/msi/Package/bin -name Package.msi -path '*Release*' | head -n 1)"
-          test -n "$msi"
+          if [ -z "$msi" ]; then
+            echo "::error::Package.msi not found, listing build output:"
+            find res/msi/Package/bin -maxdepth 5 -type f 2>/dev/null | head -n 50
+            exit 1
+          fi
           echo "found: $msi"
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           mkdir -p out
           cp "$msi" "out/rustdesk-${version}-x64.msi"
           sha256sum out/*.msi | tee out/SHA256SUMS.txt
           ls -l out
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            res/msi/msbuild.log
+            res/msi/**/*.log
+            res/msi/**/*.binlog
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload MSI
         uses: actions/upload-artifact@v4
